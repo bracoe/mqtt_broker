@@ -1,15 +1,21 @@
+extern crate chashmap;
+
+use chashmap::CHashMap;
 use std::io::{Read, Write};
 //use std::convert::TryInto;
 use std::fs::create_dir_all;
 use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::thread;
-use std::collections::LinkedList;
+use std::collections::{LinkedList, hash_map};
 use std::time::Duration;
 //use std::path::Path;
 //use std::fs::{File};
 use std::env;
+use std::str;
 //use std::fs;
 //use std::fs::OpenOptions;
+
+
 
 const MAX_MTU: usize = 15000; //MTU assumed to be 1500
 
@@ -43,6 +49,9 @@ struct MqttMessage{
 fn main() {
     //println!("Hello, world!");
 
+	let mut sub_map: CHashMap<&str, LinkedList<SocketAddr>> = CHashMap::new();
+	
+
 	let result = create_storage_dir();
 	assert!(result.is_ok());
 
@@ -53,7 +62,7 @@ fn main() {
 		match listener.accept(){
 			Ok((stream, addr)) => {
 				thread::spawn(move || {
-					handle_client(stream, addr);
+					handle_client(stream, addr, sub_map);
 				});
 			},
 			Err(e) => {
@@ -86,63 +95,24 @@ fn get_storage_dir_as_string() -> String{
 	
 }
 
-fn handle_client(stream: TcpStream, socket_address: SocketAddr){
-	let mut connected = false;
-	
-	let message = parse_message_from_stream(stream.try_clone().expect("clone failed..."));
-	assert!(message.is_ok());
-	let message = message.unwrap();
-	
-	if message.message_type != TYPE_CONNECT{
-		//Send nack
-	}
-	
-	let time_out = get_keep_alive_from_conn_msg(message);
-	stream.set_read_timeout(Some(time_out)).expect("set_read_timeout call failed");
-	stream.set_write_timeout(Some(time_out)).expect("set_read_timeout call failed");
+fn handle_client(stream: TcpStream, socket_address: SocketAddr, sub_map: CHashMap<&str , LinkedList<SocketAddr>>){
 		
-	send_connack(stream.try_clone().expect("clone failed..."));
-	connected = true;
+	let message_list = parse_message_from_stream(stream.try_clone().expect("clone failed..."));
+	assert!(message_list.is_ok());
+	let mut message_list = message_list.unwrap();
 	
-	while connected {
-		let message = parse_message_from_stream(stream.try_clone().expect("clone failed..."));
+	while !message_list.is_empty(){
 		
-		if message.is_err(){
-			connected = false;
-			break;
-		}
-		
-		let message = message.unwrap();
+		let message = message_list.pop_front().unwrap();
 		
 		//execute message request
 		println!("Executing message!");
-		let result = execute_request(message, stream.try_clone().expect("clone failed..."), socket_address);
+		let result = execute_request(message, socket_address, stream.try_clone().expect("clone failed..."), sub_map);
 		assert!(result.is_ok());
-		
-	}
-	
-	
+	}	
 }
 
-fn get_keep_alive_from_conn_msg(message:MqttMessage) -> std::time::Duration{
-	if message.optional_header.len() < 2 {
-		println!("optional_header is not big enough!");
-	}
-	
-	let opt_header = message.optional_header;
-	
-	//Get id
-	let keep_alive_upper_nibble = (opt_header[8] as u16) << 8;
-	let keep_alive_lower_nibble = opt_header[9] as u16;
-	
-	let mut time = (keep_alive_upper_nibble | keep_alive_lower_nibble) as f64;
-	time *= 1.5; //According to OASIS Standard
-	let duration = time.ceil() as u64;
-	
-	Duration::from_millis(duration)
-}
-
-fn parse_message_from_stream(mut stream: TcpStream, ) -> Result<MqttMessage, &'static str>{
+fn parse_message_from_stream(mut stream: TcpStream, ) -> Result<LinkedList<MqttMessage>, &'static str>{
 	let mut tcp_buffer = [0u8; MAX_MTU]; 
 	
 	let result = stream.read(&mut tcp_buffer);
@@ -156,50 +126,62 @@ fn parse_message_from_stream(mut stream: TcpStream, ) -> Result<MqttMessage, &'s
 	
 	println!("Relevant bytes are: {}", relevant_bytes);
 	
-	parse_message_from_buffer(tcp_buffer, relevant_bytes)
+	parse_messages_from_buffer(tcp_buffer, relevant_bytes)
 	
 }
 
-fn parse_message_from_buffer(buffer: [u8; MAX_MTU], relevant_bytes: usize) -> Result<MqttMessage, &'static str>{
+fn parse_messages_from_buffer(buffer: [u8; MAX_MTU], relevant_bytes: usize) -> Result<LinkedList<MqttMessage>, &'static str>{
 	if relevant_bytes < 2 || relevant_bytes > MAX_MTU { //Could not possible have all manditory bytes
 		return Err("Invalid message length");
 	}
 	
-	let opt_header_length = buffer[1];
 	
-	let opt_header = buffer[1..(opt_header_length as usize)].to_vec();
+	let mut message_list: LinkedList<MqttMessage> = LinkedList::new();
+	let mut pos = 0;
 	
-	let payload_start = 2 + opt_header_length as usize;
+	while pos < relevant_bytes {
+		
+		let opt_header_length = buffer[pos+1] as usize;
+		let opt_header = buffer[pos..opt_header_length].to_vec();
+		let payload_start = pos + 2 + opt_header_length;
+		let payload_length = ((opt_header[0] <<8) | opt_header[1]) as usize;
+		
+		let message = MqttMessage {
+			message_type: (0xF0u8 & buffer[pos]) >> 4 as u8,
+			dup: (0x08u8 & buffer[pos]) >> 3 as u8,
+			qos_level: (0x06u8 & buffer[pos]) >> 1 as u8,
+			retain:0x01u8 & buffer[pos] as u8,
+			remaining_length:buffer[pos+1],
+			optional_header:opt_header,
+			payload: buffer[payload_start..payload_length].to_vec()
+		};
+		
+		message_list.push_back(message);
+		
+		pos = payload_length + opt_header_length + 2; 
+	}
 	
-	 
-	
-	
-	let message = MqttMessage {
-		message_type: (0xF0u8 & buffer[0]) >> 4 as u8,
-		dup: (0x08u8 & buffer[0]) >> 3 as u8,
-		qos_level: (0x06u8 & buffer[0]) >> 1 as u8,
-		retain:0x01u8 & buffer[0] as u8,
-		remaining_length:buffer[1],
-		optional_header:opt_header,
-		payload: buffer[payload_start..relevant_bytes].to_vec()
-	};
 	
 	//println!("Coap header: {}", coap_header);
 	
-	Ok(message)
+	Ok(message_list)
 }
 
-fn execute_request(message:MqttMessage, stream: TcpStream, _socket_address: SocketAddr) -> Result<&'static str, &'static str>{
+fn execute_request(message:MqttMessage, socket_address: SocketAddr, stream: TcpStream, sub_map: CHashMap<&str, LinkedList<SocketAddr>>) -> Result<&'static str, &'static str>{
 	
 	match message.message_type {
 		
 		TYPE_CONNECT => {
 			println!("Got type with code: {}", message.message_type);
-			//handle_connect_request(message, stream);
+			handle_connect_request(stream);
 		}
 		
 		TYPE_PINGREQ => {
 			send_ping_response(stream);
+		}
+		
+		TYPE_SUBSCRIBE => {
+			handle_sub_request(message, socket_address, sub_map);
 		}
 		
 		
@@ -230,4 +212,57 @@ fn send_connack(mut stream: TcpStream){
 	
 	let result = stream.write(&response_msg);
 	assert!(result.is_ok());
+}
+
+fn handle_connect_request(stream: TcpStream){
+	send_connack(stream);
+}
+
+fn handle_sub_request(message:MqttMessage, socket_address: SocketAddr, sub_map: CHashMap<&str, LinkedList<SocketAddr>>){
+	let mut topic_list = get_topic_list(message);
+	
+	while !topic_list.is_empty() {
+		let topic = topic_list.pop_front().unwrap();
+		
+		add_sub_to_map(topic, stream, sub_map);
+	}
+}
+
+fn get_topic_list(message:MqttMessage) -> LinkedList<Vec<u8>>{
+	let payload = message.payload;
+	let last_pos = payload.len()-1;
+	let mut pos = 0;
+	
+	let mut topic_list: LinkedList<Vec<u8>> = LinkedList::new();
+	
+	while pos < last_pos{
+		let topic_length = ((payload[pos] <<8) | payload[pos+1]) as usize;
+		pos += 2;
+		
+		let topic = payload[pos..topic_length].to_vec();
+		
+		topic_list.push_back(topic);
+		println!("Added Topic to list: {}", str::from_utf8(&topic).unwrap());
+		pos += topic_length;
+	} 
+	
+	topic_list
+}
+
+fn add_sub_to_map(topic:Vec<u8>, socket_address: SocketAddr, sub_map: CHashMap<&str, LinkedList<SocketAddr>>){
+	
+	let topic_string = str::from_utf8(&topic).unwrap();
+	
+	match sub_map.get(topic_string) {
+        Some(sub_list) => {
+			if !sub_list.contains(&socket_address){
+				sub_list.push_back(socket_address);
+			}
+		}
+        None => {
+			let mut sub_list: LinkedList<SocketAddr> = LinkedList::new();
+			sub_list.push_back(socket_address);
+			sub_map.insert(topic_string, sub_list);
+		}	
+    }
 }
