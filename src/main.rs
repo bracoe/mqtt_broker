@@ -6,7 +6,8 @@ use std::io::{Read, Write};
 use std::fs::create_dir_all;
 use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::thread;
-use std::collections::{LinkedList, hash_map};
+use std::collections::{LinkedList, HashMap};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 //use std::path::Path;
 //use std::fs::{File};
@@ -17,7 +18,7 @@ use std::str;
 
 
 
-const MAX_MTU: usize = 15000; //MTU assumed to be 1500
+const MAX_MTU: usize = 150000; //MTU assumed to be 1500
 
 const TYPE_CONNECT: u8 = 1; 
 const TYPE_CONNACK: u8 = 2;
@@ -49,8 +50,7 @@ struct MqttMessage{
 fn main() {
     //println!("Hello, world!");
 
-	let mut sub_map: CHashMap<&str, LinkedList<SocketAddr>> = CHashMap::new();
-	
+	let sub_map: Arc<RwLock<HashMap<String, Vec<SocketAddr>>>> = Arc::new(RwLock::new(HashMap::new()));
 
 	let result = create_storage_dir();
 	assert!(result.is_ok());
@@ -58,11 +58,13 @@ fn main() {
 	let listener = TcpListener::bind("127.0.0.1:1883").unwrap();
 	
 	loop{
-
+		
+		let sub_map_clone = sub_map.clone();
+	
 		match listener.accept(){
 			Ok((stream, addr)) => {
 				thread::spawn(move || {
-					handle_client(stream, addr, sub_map);
+					handle_client(stream, addr, &sub_map_clone);
 				});
 			},
 			Err(e) => {
@@ -95,7 +97,7 @@ fn get_storage_dir_as_string() -> String{
 	
 }
 
-fn handle_client(stream: TcpStream, socket_address: SocketAddr, sub_map: CHashMap<&str , LinkedList<SocketAddr>>){
+fn handle_client(stream: TcpStream, socket_address: SocketAddr, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>){
 		
 	let message_list = parse_message_from_stream(stream.try_clone().expect("clone failed..."));
 	assert!(message_list.is_ok());
@@ -111,6 +113,7 @@ fn handle_client(stream: TcpStream, socket_address: SocketAddr, sub_map: CHashMa
 		assert!(result.is_ok());
 	}	
 }
+
 
 fn parse_message_from_stream(mut stream: TcpStream, ) -> Result<LinkedList<MqttMessage>, &'static str>{
 	let mut tcp_buffer = [0u8; MAX_MTU]; 
@@ -144,7 +147,10 @@ fn parse_messages_from_buffer(buffer: [u8; MAX_MTU], relevant_bytes: usize) -> R
 		let opt_header_length = buffer[pos+1] as usize;
 		let opt_header = buffer[pos..opt_header_length].to_vec();
 		let payload_start = pos + 2 + opt_header_length;
-		let payload_length = ((opt_header[0] <<8) | opt_header[1]) as usize;
+		
+		let upper_length_nibble = (opt_header[1] as u16) << 8;
+		let lower_length_nibble = opt_header[2] as u16;
+		let payload_length = (upper_length_nibble | lower_length_nibble) as usize;
 		
 		let message = MqttMessage {
 			message_type: (0xF0u8 & buffer[pos]) >> 4 as u8,
@@ -155,6 +161,18 @@ fn parse_messages_from_buffer(buffer: [u8; MAX_MTU], relevant_bytes: usize) -> R
 			optional_header:opt_header,
 			payload: buffer[payload_start..payload_length].to_vec()
 		};
+		
+		println!("Found message!");
+		println!("Type: {}", message.message_type);
+		println!("DUP: {}", message.dup);
+		println!("QOS: {}", message.qos_level);
+		println!("Retain: {}", message.retain);
+		println!("Remaining Length: {}", message.remaining_length);
+		
+		println!("Payload length: {}", payload_length);
+		println!("Relevant bytes in stream: {}", relevant_bytes);
+		//println!("Optional Header: {}", message.optional_header);
+		//println!("Payload: {}", message.payload);
 		
 		message_list.push_back(message);
 		
@@ -167,12 +185,10 @@ fn parse_messages_from_buffer(buffer: [u8; MAX_MTU], relevant_bytes: usize) -> R
 	Ok(message_list)
 }
 
-fn execute_request(message:MqttMessage, socket_address: SocketAddr, stream: TcpStream, sub_map: CHashMap<&str, LinkedList<SocketAddr>>) -> Result<&'static str, &'static str>{
+fn execute_request(message:MqttMessage, socket_address: SocketAddr, stream: TcpStream, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>) -> Result<&'static str, &'static str>{
 	
 	match message.message_type {
-		
 		TYPE_CONNECT => {
-			println!("Got type with code: {}", message.message_type);
 			handle_connect_request(stream);
 		}
 		
@@ -181,13 +197,17 @@ fn execute_request(message:MqttMessage, socket_address: SocketAddr, stream: TcpS
 		}
 		
 		TYPE_SUBSCRIBE => {
-			handle_sub_request(message, socket_address, sub_map);
+			handle_sub_request(message, stream, socket_address, sub_map);
+		}
+		
+		TYPE_UNSUBSCRIBE => {
+			handle_unsub_request(message, stream, socket_address, sub_map);
 		}
 		
 		
 		
 		_ => {
-			println!("Got type with code: {}", message.message_type);
+			println!("No implementation for code: {}", message.message_type);
 		}
 	}
 	
@@ -214,18 +234,57 @@ fn send_connack(mut stream: TcpStream){
 	assert!(result.is_ok());
 }
 
+fn send_suback(mut stream: TcpStream, packet_id: Vec<u8>){
+	let mut response_msg = Vec::<u8>::new();
+	response_msg.push(0x48); //Set type suback
+	response_msg.push(packet_id[0]); //Set type connack
+	response_msg.push(packet_id[1]); //Set remaining length to 2 byte
+	response_msg.push(0x00); //Success maximum QOS 0
+	
+	let result = stream.write(&response_msg);
+	assert!(result.is_ok());
+}
+
+fn send_unsuback(mut stream: TcpStream, packet_id: Vec<u8>){
+	let mut response_msg = Vec::<u8>::new();
+	response_msg.push(0x58); //Set type unsuback
+	response_msg.push(packet_id[0]); //Set type connack
+	response_msg.push(packet_id[1]); //Set remaining length to 2 byte
+	
+	let result = stream.write(&response_msg);
+	assert!(result.is_ok());
+}
+
 fn handle_connect_request(stream: TcpStream){
 	send_connack(stream);
 }
 
-fn handle_sub_request(message:MqttMessage, socket_address: SocketAddr, sub_map: CHashMap<&str, LinkedList<SocketAddr>>){
+fn handle_sub_request(message:MqttMessage, stream: TcpStream, socket_address: SocketAddr, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>){
+	
+	let packet_id = message.optional_header.clone();
 	let mut topic_list = get_topic_list(message);
 	
 	while !topic_list.is_empty() {
 		let topic = topic_list.pop_front().unwrap();
 		
-		add_sub_to_map(topic, stream, sub_map);
+		add_sub_to_map(topic, socket_address, sub_map);
 	}
+	
+	send_suback(stream, packet_id);
+}
+
+fn handle_unsub_request(message:MqttMessage, stream: TcpStream, socket_address: SocketAddr, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>){
+	
+	let packet_id = message.optional_header.clone();
+	let mut topic_list = get_topic_list(message);
+	
+	while !topic_list.is_empty() {
+		let topic = topic_list.pop_front().unwrap();
+		
+		remove_sub_from_map(topic, socket_address, sub_map);
+	}
+	
+	send_unsuback(stream, packet_id);
 }
 
 fn get_topic_list(message:MqttMessage) -> LinkedList<Vec<u8>>{
@@ -241,7 +300,7 @@ fn get_topic_list(message:MqttMessage) -> LinkedList<Vec<u8>>{
 		
 		let topic = payload[pos..topic_length].to_vec();
 		
-		topic_list.push_back(topic);
+		topic_list.push_back(topic.clone());
 		println!("Added Topic to list: {}", str::from_utf8(&topic).unwrap());
 		pos += topic_length;
 	} 
@@ -249,20 +308,41 @@ fn get_topic_list(message:MqttMessage) -> LinkedList<Vec<u8>>{
 	topic_list
 }
 
-fn add_sub_to_map(topic:Vec<u8>, socket_address: SocketAddr, sub_map: CHashMap<&str, LinkedList<SocketAddr>>){
+fn add_sub_to_map(topic:Vec<u8>, socket_address: SocketAddr, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>){
 	
-	let topic_string = str::from_utf8(&topic).unwrap();
+	let topic_string = String::from_utf8(topic).unwrap();
 	
-	match sub_map.get(topic_string) {
+	let mut unlocked_sub_map = sub_map.write().unwrap();
+	
+	match unlocked_sub_map.get_mut(&topic_string) {
         Some(sub_list) => {
 			if !sub_list.contains(&socket_address){
-				sub_list.push_back(socket_address);
+				sub_list.push(socket_address);
 			}
 		}
         None => {
-			let mut sub_list: LinkedList<SocketAddr> = LinkedList::new();
-			sub_list.push_back(socket_address);
-			sub_map.insert(topic_string, sub_list);
+			let mut sub_list: Vec<SocketAddr> = Vec::new();
+			sub_list.push(socket_address);
+			unlocked_sub_map.insert(topic_string, sub_list);
 		}	
+    }
+}
+
+fn remove_sub_from_map(topic:Vec<u8>, socket_address: SocketAddr, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>){
+	
+	let topic_string = String::from_utf8(topic).unwrap();
+	
+	let mut unlocked_sub_map = sub_map.write().unwrap();
+	
+	match unlocked_sub_map.get_mut(&topic_string) {
+        Some(sub_list) => {
+			if sub_list.contains(&socket_address){
+				let index = sub_list.iter().position(|x| *x == socket_address).unwrap();
+				sub_list.remove(index);
+			}
+		}
+		None => {
+			println!("Did not find in subs for topic: {}", topic_string);
+		}
     }
 }
