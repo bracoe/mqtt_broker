@@ -9,6 +9,7 @@ use std::thread;
 use std::collections::{LinkedList, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use std::time;
 //use std::path::Path;
 //use std::fs::{File};
 use std::env;
@@ -97,7 +98,7 @@ fn get_storage_dir_as_string() -> String{
 	
 }
 
-fn handle_client(stream: TcpStream, socket_address: SocketAddr, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>){
+fn handle_client(mut stream: TcpStream, socket_address: SocketAddr, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>){
 	let mut connected = false;
 	
 	loop {
@@ -105,6 +106,7 @@ fn handle_client(stream: TcpStream, socket_address: SocketAddr, sub_map: &Arc<Rw
 		let message_list = parse_message_from_stream(stream.try_clone().expect("clone failed..."));
 		
 		if message_list.is_err(){
+			println!("Breaking because error");
 			break;
 		}
 		
@@ -116,12 +118,14 @@ fn handle_client(stream: TcpStream, socket_address: SocketAddr, sub_map: &Arc<Rw
 			let message = message_list.pop_front().unwrap();
 			
 			if message.message_type == TYPE_CONNECT{
-				let time_out = get_keep_alive_from_conn_msg(message.clone());
+				/*let time_out = get_keep_alive_from_conn_msg(message.clone());
 				stream.set_read_timeout(Some(time_out)).expect("set_read_timeout call failed");
 				stream.set_write_timeout(Some(time_out)).expect("set_read_timeout call failed");
+				*/
 				connected = true;
 			}
 			else if message.message_type == TYPE_DISCONNECT {
+				println!("Breaking because disconnected");
 				break;
 			}
 			
@@ -132,10 +136,13 @@ fn handle_client(stream: TcpStream, socket_address: SocketAddr, sub_map: &Arc<Rw
 		}
 		
 		if !connected {
+			println!("Breaking because not connected");
 			break;
 		}
 	}
-		
+	
+	println!("Exiting thread");
+	
 }
 
 fn get_keep_alive_from_conn_msg(message:MqttMessage) -> std::time::Duration{
@@ -162,12 +169,12 @@ fn parse_message_from_stream(mut stream: TcpStream, ) -> Result<LinkedList<MqttM
 	
 	let result = stream.read(&mut tcp_buffer);
 	
-	if result.is_err(){
-		return Err("Probably timed-out!")
-	}
-	
-	assert!(result.is_ok());
-	let relevant_bytes = result.unwrap();
+	let relevant_bytes = match result {
+        Ok(relevant_bytes) => relevant_bytes,
+        Err(error) => {
+            panic!("Problem reading from socket: {:?}", error)
+        },
+    };
 	
 	println!("Relevant bytes are: {}", relevant_bytes);
 	
@@ -258,6 +265,10 @@ fn execute_request(message:MqttMessage, socket_address: SocketAddr, stream: TcpS
 			handle_unsub_request(message, stream, socket_address, sub_map);
 		}
 		
+		TYPE_PUBLISH => {
+			handle_publish_request(message, stream, sub_map);
+		}
+		
 		
 		
 		_ => {
@@ -267,6 +278,7 @@ fn execute_request(message:MqttMessage, socket_address: SocketAddr, stream: TcpS
 	
 	Ok("OK")
 }
+
 
 fn send_ping_response(mut stream: TcpStream){
 	let mut response_msg = Vec::<u8>::new();
@@ -288,6 +300,9 @@ fn send_connack(mut stream: TcpStream){
 	let result = stream.write(&response_msg);
 	assert!(result.is_ok());
 	println!("We have send a connack!");
+	
+	let stream = stream.flush();
+	assert!(stream.is_ok());
 }
 
 fn send_suback(mut stream: TcpStream, packet_id: Vec<u8>){
@@ -300,6 +315,9 @@ fn send_suback(mut stream: TcpStream, packet_id: Vec<u8>){
 	
 	let result = stream.write(&response_msg);
 	assert!(result.is_ok());
+	
+	let stream = stream.flush();
+	assert!(stream.is_ok());
 	
 	println!("We have send a suback!");
 }
@@ -314,6 +332,9 @@ fn send_unsuback(mut stream: TcpStream, packet_id: Vec<u8>){
 	let result = stream.write(&response_msg);
 	assert!(result.is_ok());
 	
+	let stream = stream.flush();
+	assert!(stream.is_ok());
+	
 	println!("We have send a unsuback!");
 }
 
@@ -324,7 +345,7 @@ fn handle_connect_request(stream: TcpStream){
 fn handle_sub_request(message:MqttMessage, stream: TcpStream, socket_address: SocketAddr, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>){
 	
 	let packet_id = message.optional_header.clone();
-	let topic_list = get_topic_list(message);
+	let topic_list = get_sub_topic_list(message);
 	assert!(topic_list.is_ok());
 	let mut topic_list = topic_list.unwrap();
 	
@@ -343,7 +364,7 @@ fn handle_sub_request(message:MqttMessage, stream: TcpStream, socket_address: So
 fn handle_unsub_request(message:MqttMessage, stream: TcpStream, socket_address: SocketAddr, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>){
 	
 	let packet_id = message.optional_header.clone();
-	let topic_list = get_topic_list(message);
+	let topic_list = get_sub_topic_list(message);
 	assert!(topic_list.is_ok());
 	let mut topic_list = topic_list.unwrap();
 	
@@ -359,7 +380,7 @@ fn handle_unsub_request(message:MqttMessage, stream: TcpStream, socket_address: 
 	send_unsuback(stream, packet_id);
 }
 
-fn get_topic_list(message:MqttMessage) -> Result<LinkedList<Vec<u8>>, &'static str>{
+fn get_sub_topic_list(message:MqttMessage) -> Result<LinkedList<Vec<u8>>, &'static str>{
 	let payload = message.payload;
 	
 	if payload.is_empty(){
@@ -432,6 +453,96 @@ fn remove_sub_from_map(topic:Vec<u8>, socket_address: SocketAddr, sub_map: &Arc<
 		}
 		None => {
 			println!("Did not find in subs for topic: {}", topic_string);
+		}
+    }
+}
+
+fn handle_publish_request(message:MqttMessage, _stream: TcpStream, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>){
+	
+	let opt_header = message.optional_header.clone();
+	let topic = get_publish_topic(opt_header);
+		
+	println!("We are handling topic: {}", String::from_utf8(topic.clone()).unwrap());
+	
+	let mut subs_list = get_subs_for_topic(topic, sub_map);
+	
+	while subs_list.is_empty(){
+		let sub_socket = subs_list.pop();
+		let sub_socket = sub_socket.unwrap();
+		
+		send_publish_msg(message.clone(), sub_socket);
+		println!("Publishing to subscriber");
+	}
+	
+	/*if message.qos_level == 1{
+		send_puback(stream);
+	}*/
+}
+
+fn send_publish_msg(message:MqttMessage, socket_address: SocketAddr){
+	let buffer = mqtt_msg_to_u8_vec(message);
+	
+	let stream = TcpStream::connect(socket_address);
+	assert!(stream.is_ok());
+	
+	let mut stream = stream.unwrap();
+	
+    let result = stream.write(&buffer);
+	assert!(result.is_ok());
+	
+	let stream = stream.flush();
+	assert!(stream.is_ok());
+	
+	println!("We have sent publish to {}", socket_address);
+	
+}
+
+fn mqtt_msg_to_u8_vec(message: MqttMessage) -> Vec<u8>{
+	
+	let first_byte = (message.message_type << 4) | (message.dup << 3) | (message.qos_level << 1) | message.retain;
+	
+	let mut buffer = Vec::<u8>::new();
+	let mut opt_header = message.optional_header.clone();
+	let mut payload = message.payload.clone();
+	
+	buffer.push(first_byte);
+	buffer.push(message.remaining_length);
+	buffer.append(&mut opt_header);
+	buffer.append(&mut payload);
+	
+	buffer
+	
+}
+
+fn get_publish_topic(optional_header:Vec<u8>) -> Vec<u8>{
+	
+	assert!(optional_header.len() > 4);
+	
+	let upper_length_nibble = (optional_header[0] as u16) << 8;
+	let lower_length_nibble = optional_header[1] as u16;
+	let topic_length = (upper_length_nibble | lower_length_nibble) as usize;
+	
+	optional_header[2..2+topic_length].to_vec()
+	
+
+}
+
+fn get_subs_for_topic(topic:Vec<u8>, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>) -> Vec<SocketAddr>{
+	
+	let topic_string = String::from_utf8(topic);
+	assert!(topic_string.is_ok());
+	let topic_string = topic_string.unwrap();
+	
+	let unlocked_sub_map = sub_map.write();
+	let mut unlocked_sub_map = unlocked_sub_map.unwrap();
+	
+	match unlocked_sub_map.get_mut(&topic_string) {
+        Some(sub_list) => {
+			sub_list.clone()
+		}
+		None => {
+			println!("Did not find in subs for topic: {}", topic_string);
+			Vec::new()
 		}
     }
 }
