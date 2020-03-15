@@ -1,6 +1,4 @@
-extern crate chashmap;
-
-use chashmap::CHashMap;
+use std::thread::sleep;
 use std::io::{Read, Write};
 //use std::convert::TryInto;
 use std::fs::create_dir_all;
@@ -8,7 +6,6 @@ use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::thread;
 use std::collections::{LinkedList, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
 use std::time;
 //use std::path::Path;
 //use std::fs::{File};
@@ -22,18 +19,18 @@ use std::str;
 const MAX_MTU: usize = 150_000; //MTU assumed to be 1500
 
 const TYPE_CONNECT: u8 = 1; 
-const TYPE_CONNACK: u8 = 2;
+//const TYPE_CONNACK: u8 = 2;
 const TYPE_PUBLISH: u8 = 3;
-const TYPE_PUBACK: u8 = 4;
-const TYPE_PUBREC: u8 = 5;
-const TYPE_PUBREL: u8 = 6;
-const TYPE_PUBCOMP: u8 = 7;
+//const TYPE_PUBACK: u8 = 4;
+//const TYPE_PUBREC: u8 = 5;
+//const TYPE_PUBREL: u8 = 6;
+//const TYPE_PUBCOMP: u8 = 7;
 const TYPE_SUBSCRIBE: u8 = 8;
-const TYPE_SUBACK: u8 = 9;
+//const TYPE_SUBACK: u8 = 9;
 const TYPE_UNSUBSCRIBE: u8 = 10;
-const TYPE_UNSUBACK: u8 = 11;
+//const TYPE_UNSUBACK: u8 = 11;
 const TYPE_PINGREQ: u8 = 12;
-const TYPE_PINGRESP: u8 = 13;
+//const TYPE_PINGRESP: u8 = 13;
 const TYPE_DISCONNECT: u8 = 14;
 
 ///A structure for saving the entire MQTT message
@@ -52,6 +49,7 @@ fn main() {
     //println!("Hello, world!");
 
 	let sub_map: Arc<RwLock<HashMap<String, Vec<SocketAddr>>>> = Arc::new(RwLock::new(HashMap::new()));
+	let pub_map: Arc<Mutex<HashMap<SocketAddr, Vec<MqttMessage>>>> = Arc::new(Mutex::new(HashMap::new()));
 
 	let result = create_storage_dir();
 	assert!(result.is_ok());
@@ -61,11 +59,12 @@ fn main() {
 	loop{
 		
 		let sub_map_clone = sub_map.clone();
+		let pub_map_clone = pub_map.clone();
 	
 		match listener.accept(){
 			Ok((stream, addr)) => {
 				thread::spawn(move || {
-					handle_client(stream, addr, &sub_map_clone);
+					handle_client(stream, addr, &sub_map_clone, &pub_map_clone);
 				});
 			},
 			Err(e) => {
@@ -98,16 +97,21 @@ fn get_storage_dir_as_string() -> String{
 	
 }
 
-fn handle_client(mut stream: TcpStream, socket_address: SocketAddr, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>){
+fn handle_client(stream: TcpStream, socket_address: SocketAddr, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>, pub_map: &Arc<Mutex<HashMap<SocketAddr, Vec<MqttMessage>>>>){
 	let mut connected = false;
+	
+	let result = stream.set_nonblocking(true);
+	assert!(result.is_ok());
 	
 	loop {
 		
 		let message_list = parse_message_from_stream(stream.try_clone().expect("clone failed..."));
 		
 		if message_list.is_err(){
-			println!("Breaking because error");
-			break;
+			//println!("Nothing could be read!");
+			sleep(time::Duration::from_millis(100));
+			publish_messages(stream.try_clone().expect("clone failed..."), socket_address, pub_map);
+			continue;
 		}
 		
 		assert!(message_list.is_ok());
@@ -131,7 +135,7 @@ fn handle_client(mut stream: TcpStream, socket_address: SocketAddr, sub_map: &Ar
 			
 			//execute message request
 			println!("Executing message!");
-			let result = execute_request(message, socket_address, stream.try_clone().expect("clone failed..."), sub_map);
+			let result = execute_request(message, socket_address, stream.try_clone().expect("clone failed..."), sub_map, pub_map);
 			assert!(result.is_ok());
 		}
 		
@@ -139,30 +143,44 @@ fn handle_client(mut stream: TcpStream, socket_address: SocketAddr, sub_map: &Ar
 			println!("Breaking because not connected");
 			break;
 		}
+		
+		//Check if something needs to be published.
+		publish_messages(stream.try_clone().expect("clone failed..."), socket_address, pub_map);
 	}
 	
 	println!("Exiting thread");
 	
 }
 
-fn get_keep_alive_from_conn_msg(message:MqttMessage) -> std::time::Duration{
-	if message.optional_header.len() < 2 {
-		println!("optional_header is not big enough!");
+fn publish_messages(stream: TcpStream, socket_address: SocketAddr, pub_map: &Arc<Mutex<HashMap<SocketAddr, Vec<MqttMessage>>>>){
+	
+	let result = pub_map.lock();
+	let mut unlocked_pub_map = match result {
+        Ok(unlocked_pub_map) => unlocked_pub_map,
+        Err(error) => {
+			eprintln!("Problem reading with map: {:?}", error);
+           	return;
+        },
+    };
+	
+	//println!("Unlocked pub_map for checking!");
+	
+	if unlocked_pub_map.contains_key(&socket_address){
+		let message_queue = unlocked_pub_map.get_mut(&socket_address);
+		let message_queue = message_queue.unwrap();
+		
+		while !message_queue.is_empty(){
+			let message = message_queue.pop();
+			let message = message.unwrap();
+			
+			send_publish_msg(message, stream.try_clone().expect("clone failed..."));
+		}
+		
 	}
-
-	let opt_header = message.optional_header;
-
-	//Get id
-	let keep_alive_upper_nibble = (opt_header[8] as u16) << 8;
-	let keep_alive_lower_nibble = opt_header[9] as u16;
-
-	let mut time = (keep_alive_upper_nibble | keep_alive_lower_nibble) as f64;
-	time *= 1.5; //According to OASIS Standard
-	let duration = time.ceil() as u64;
-
-	Duration::from_millis(duration)
+	
+	
+	
 }
-
 
 fn parse_message_from_stream(mut stream: TcpStream, ) -> Result<LinkedList<MqttMessage>, &'static str>{
 	let mut tcp_buffer = [0u8; MAX_MTU]; 
@@ -171,12 +189,13 @@ fn parse_message_from_stream(mut stream: TcpStream, ) -> Result<LinkedList<MqttM
 	
 	let relevant_bytes = match result {
         Ok(relevant_bytes) => relevant_bytes,
-        Err(error) => {
-            panic!("Problem reading from socket: {:?}", error)
+        Err(_error) => {
+			//println!("Problem reading from socket: {:?}", error);
+           	return Err("Problem reading from socket!");
         },
     };
 	
-	println!("Relevant bytes are: {}", relevant_bytes);
+	//println!("Relevant bytes are: {}", relevant_bytes);
 	
 	parse_messages_from_buffer(tcp_buffer, relevant_bytes)
 	
@@ -246,7 +265,7 @@ fn parse_messages_from_buffer(buffer: [u8; MAX_MTU], relevant_bytes: usize) -> R
 	Ok(message_list)
 }
 
-fn execute_request(message:MqttMessage, socket_address: SocketAddr, stream: TcpStream, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>) -> Result<&'static str, &'static str>{
+fn execute_request(message:MqttMessage, socket_address: SocketAddr, stream: TcpStream, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>, pub_map: &Arc<Mutex<HashMap<SocketAddr, Vec<MqttMessage>>>>) -> Result<&'static str, &'static str>{
 	
 	match message.message_type {
 		TYPE_CONNECT => {
@@ -266,7 +285,7 @@ fn execute_request(message:MqttMessage, socket_address: SocketAddr, stream: TcpS
 		}
 		
 		TYPE_PUBLISH => {
-			handle_publish_request(message, stream, sub_map);
+			handle_publish_request(message, stream, sub_map, pub_map);
 		}
 		
 		
@@ -425,6 +444,8 @@ fn add_sub_to_map(topic:Vec<u8>, socket_address: SocketAddr, sub_map: &Arc<RwLoc
         Some(sub_list) => {
 			if !sub_list.contains(&socket_address){
 				sub_list.push(socket_address);
+				
+				println!("Added to sub map.");
 			}
 		}
         None => {
@@ -457,20 +478,26 @@ fn remove_sub_from_map(topic:Vec<u8>, socket_address: SocketAddr, sub_map: &Arc<
     }
 }
 
-fn handle_publish_request(message:MqttMessage, _stream: TcpStream, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>){
+fn handle_publish_request(message:MqttMessage, _stream: TcpStream, sub_map: &Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>, pub_map: &Arc<Mutex<HashMap<SocketAddr, Vec<MqttMessage>>>>){
 	
 	let opt_header = message.optional_header.clone();
 	let topic = get_publish_topic(opt_header);
 		
-	println!("We are handling topic: {}", String::from_utf8(topic.clone()).unwrap());
+	println!("We are handling publish topic: {}", String::from_utf8(topic.clone()).unwrap());
 	
 	let mut subs_list = get_subs_for_topic(topic, sub_map);
 	
-	while subs_list.is_empty(){
+	if subs_list.is_empty(){
+		println!("No subscribers for topic");
+	}
+	
+	while !subs_list.is_empty(){
 		let sub_socket = subs_list.pop();
 		let sub_socket = sub_socket.unwrap();
 		
-		send_publish_msg(message.clone(), sub_socket);
+		println!("Sending publish message");
+		
+		register_msg_at_pub_map(message.clone(), sub_socket, pub_map);
 		println!("Publishing to subscriber");
 	}
 	
@@ -479,22 +506,43 @@ fn handle_publish_request(message:MqttMessage, _stream: TcpStream, sub_map: &Arc
 	}*/
 }
 
-fn send_publish_msg(message:MqttMessage, socket_address: SocketAddr){
+fn register_msg_at_pub_map(message:MqttMessage, socket_address: SocketAddr, pub_map: &Arc<Mutex<HashMap<SocketAddr, Vec<MqttMessage>>>>){
+	
+	
+	
+	let unlocked_pub_map = pub_map.lock();
+	assert!(unlocked_pub_map.is_ok());
+	let mut unlocked_pub_map = unlocked_pub_map.unwrap();
+	
+	if unlocked_pub_map.contains_key(&socket_address){
+		let message_queue = unlocked_pub_map.get_mut(&socket_address);
+		let message_queue = message_queue.unwrap();
+		
+		message_queue.push(message);
+		
+	}
+	else{
+		let mut message_queue = Vec::<MqttMessage>::new();
+		message_queue.push(message);
+		
+		unlocked_pub_map.insert(socket_address,message_queue);
+	}
+	
+	println!("Registered publish message");
+}
+
+fn send_publish_msg(message:MqttMessage, mut stream: TcpStream){
 	let buffer = mqtt_msg_to_u8_vec(message);
 	
-	let stream = TcpStream::connect(socket_address);
-	assert!(stream.is_ok());
-	
-	let mut stream = stream.unwrap();
+	println!("Publishing message changed to buffer!");
 	
     let result = stream.write(&buffer);
 	assert!(result.is_ok());
 	
+	println!("Publishing message sent!");
+	
 	let stream = stream.flush();
-	assert!(stream.is_ok());
-	
-	println!("We have sent publish to {}", socket_address);
-	
+	assert!(stream.is_ok());	
 }
 
 fn mqtt_msg_to_u8_vec(message: MqttMessage) -> Vec<u8>{
@@ -538,6 +586,7 @@ fn get_subs_for_topic(topic:Vec<u8>, sub_map: &Arc<RwLock<HashMap<String, Vec<So
 	
 	match unlocked_sub_map.get_mut(&topic_string) {
         Some(sub_list) => {
+			println!("We found subscribers");
 			sub_list.clone()
 		}
 		None => {
